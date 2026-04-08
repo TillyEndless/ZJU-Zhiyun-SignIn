@@ -1,14 +1,58 @@
-import { COURSES, ZJUAM } from "login-zju";
+import { CLASSROOM, COURSES, ZJUAM } from "login-zju";
 import { v4 as uuidv4 } from "uuid";
-import "dotenv/config";
+import dotenv from "dotenv";
 import crypto from "crypto";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import dingTalk from "../shared/dingtalk-webhook.js";
 import Decimal from "decimal.js";
 Decimal.set({ precision: 100 });
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// 无论从哪级目录启动，优先加载仓库根目录 .env（避免 ZJU_PASSWORD 未注入导致 login-zju 报 n is not iterable）
+dotenv.config({ path: path.join(__dirname, "..", ".env") });
+dotenv.config();
+
+const zjuUser = (process.env.ZJU_USERNAME ?? "").trim();
+const zjuPass = process.env.ZJU_PASSWORD;
+if (!zjuUser || zjuPass === undefined || zjuPass === null || String(zjuPass) === "") {
+  console.error(
+    "[Auto Sign-in] 缺少 ZJU_USERNAME 或 ZJU_PASSWORD。请检查仓库根目录 .env，并从项目根执行：\n" +
+      "  node courses.zju/autosign.js"
+  );
+  process.exit(1);
+}
+const EVENT_LOG_PATH =
+  process.env.AUTOSIGN_EVENT_LOG || path.join(__dirname, "autosign-events.log");
+
+function appendEventLog(line) {
+  try {
+    fs.appendFileSync(
+      EVENT_LOG_PATH,
+      `[${new Date().toISOString()}] ${line}\n`,
+      "utf8"
+    );
+  } catch (_e) {
+    /* ignore disk errors */
+  }
+}
+
+/** 签到相关：钉钉 + 控制台 + 本地日志（tmux 刷屏丢记录时可查此文件） */
+function signNotify(msg) {
+  appendEventLog(msg.replace(/\n/g, " | "));
+  console.log(msg);
+  dingTalk(msg);
+}
+
 const CONFIG = {
   raderAt: "ZJGD1",
-  coldDownTime: 4000, // 4s
+  coldDownTime: 1500, // 1.5s
+  transcriptDebugIntervalMs: Number(process.env.DEBUG_TRANSCRIPT_INTERVAL_MS || 8000),
+  /** 无点名时终端心跳间隔（毫秒）。0 = 不在终端打印「No rollcalls」 */
+  emptyConsoleLogIntervalMs: Number(
+    process.env.AUTOSIGN_EMPTY_CONSOLE_MS ?? 60_000
+  ),
 };
 const RaderInfo = {
   ZJGD1: [120.089136, 30.302331], //东一教学楼
@@ -39,18 +83,83 @@ const sendBoth=(msg)=>{
   dingTalk(msg);
 }
 
+const formatApiTime = (value) => {
+  if (!value) return "";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  return d.toLocaleString("zh-CN", { hour12: false });
+};
 
-const courses = new COURSES(
-  new ZJUAM(process.env.ZJU_USERNAME, process.env.ZJU_PASSWORD)
-);
+const buildRollcallTimeHint = (rollcall) => {
+  const startCandidate =
+    rollcall?.rollcall_time ||
+    rollcall?.published_at ||
+    rollcall?.start_at ||
+    rollcall?.created_at ||
+    "";
+  const endCandidate =
+    rollcall?.end_at ||
+    rollcall?.expire_at ||
+    rollcall?.expired_at ||
+    rollcall?.deadline_at ||
+    "";
 
-dingTalk("[Auto Sign-in] Logged in as " + process.env.ZJU_USERNAME);
+  const startText = formatApiTime(startCandidate);
+  const endText = formatApiTime(endCandidate);
+
+  if (startText && endText) {
+    return `签到时间范围：${startText} ~ ${endText}`;
+  }
+  if (startText) {
+    return `签到开始时间：${startText}（结束时间未返回）`;
+  }
+  if (endText) {
+    return `签到结束时间：${endText}（开始时间未返回）`;
+  }
+  if (rollcall?.is_expired === true) {
+    return "签到时间范围：该签到已过期（接口未返回具体时间）";
+  }
+  return "签到时间范围：接口未返回";
+};
+
+const buildRollcallCourseHint = (rollcall) => {
+  const parts = [];
+  if (rollcall?.course_id != null && rollcall.course_id !== "")
+    parts.push(`course_id=${rollcall.course_id}`);
+  if (rollcall?.class_name)
+    parts.push(`班级=${rollcall.class_name}`);
+  if (rollcall?.grade_name)
+    parts.push(`年级=${rollcall.grade_name}`);
+  return parts.length ? `（${parts.join("，")}）` : "";
+};
+
+
+const courses = new COURSES(new ZJUAM(zjuUser, String(zjuPass)));
+const classroom = new CLASSROOM(new ZJUAM(zjuUser, String(zjuPass)));
+
+appendEventLog("autosign started");
+sendBoth("[Auto Sign-in] Started. Waiting for courses login...");
+let loginNotified = false;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let req_num = 0;
 
 let we_are_bruteforcing = [];
+/** 避免同一 rollcall 每轮轮询重复发「开始签到」钉钉 */
+const radarNotifySent = new Set();
+/** 避免同一 rollcall 并发多次 answerRaderRollcall */
+const radarAnswerInFlight = new Set();
+const radarFailureNotified = new Set();
+const radarSuccessNotified = new Set();
+const alreadyOnCallNotified = new Set();
+let lastFetchRollcallsErrorDingAt = 0;
+let lastRollcallIdsKey = "";
+let lastEmptyConsoleLogAt = 0;
+
+if (process.env.DEBUG_TRANSCRIPT === "true") {
+  startTranscriptDebugLoop();
+}
 
 // if (false)
 (async () => {
@@ -60,26 +169,64 @@ let we_are_bruteforcing = [];
       .then((v) => v.text())
       .then(async (fa) => {
         try {
-          return await JSON.parse(fa)
+          return JSON.parse(fa);
         } catch (e) {
-          sendBoth("[-][Auto Sign-in] Something went wrong: " + fa+"\nError: "+e.toString());
+          signNotify(
+            "[-][Auto Sign-in] 点名接口返回非 JSON: " +
+              fa.slice(0, 400) +
+              (fa.length > 400 ? "…" : "") +
+              "\nError: " +
+              e.toString()
+          );
+          return null;
         }
       })
   //     .then((v) => v.json())
       .then(async (v) => {
+        if (!v || !Array.isArray(v.rollcalls)) {
+          console.log(`[Auto Sign-in](Req #${++req_num}) Invalid rollcalls response, skip.`);
+          return;
+        }
+        if (!loginNotified) {
+          signNotify("[Auto Sign-in] Logged in as " + zjuUser);
+          loginNotified = true;
+        }
+        req_num++;
         if (v.rollcalls.length == 0) {
-          console.log(`[Auto Sign-in](Req #${++req_num}) No rollcalls found.`);
+          const now = Date.now();
+          const iv = CONFIG.emptyConsoleLogIntervalMs;
+          if (iv > 0 && now - lastEmptyConsoleLogAt > iv) {
+            lastEmptyConsoleLogAt = now;
+            console.log(
+              `[Auto Sign-in](Req #${req_num}) No rollcalls（终端约每 ${Math.round(iv / 1000)}s 提示一次；签到见钉钉与 ${EVENT_LOG_PATH}）`
+            );
+          }
         } else {
           console.log(
-            `[Auto Sign-in](Req #${++req_num}) Found ${v.rollcalls.length} rollcalls. 
-                They are:${v.rollcalls.map(
-              (rc) => `
-                  - ${rc.title} @ ${rc.course_title} by ${rc.created_by_name} (${rc.department_name})`
-            )}`
+            `[Auto Sign-in](Req #${req_num}) Found ${v.rollcalls.length} rollcalls.`
           );
-          // console.log(v.rollcalls);
-
-
+          const idsKey = v.rollcalls
+            .map((r) => r.rollcall_id)
+            .sort()
+            .join(",");
+          if (idsKey !== lastRollcallIdsKey) {
+            lastRollcallIdsKey = idsKey;
+            const summary = v.rollcalls
+              .map((rc) => {
+                const hint = buildRollcallCourseHint(rc);
+                const kind =
+                  rc.is_radar || rc.source === "radar"
+                    ? "雷达"
+                    : rc.is_number
+                      ? "数字"
+                      : "未知类型";
+                return `· #${rc.rollcall_id} ${kind} ${rc.course_title || ""}${hint} status=${rc.status ?? ""}/${rc.status_name ?? ""}`;
+              })
+              .join("\n");
+            signNotify(
+              `[签到检测] 学在浙大当前返回 ${v.rollcalls.length} 条点名，请及时处理：\n${summary}`
+            );
+          }
 
           v.rollcalls.forEach((rollcall) => {
             /**
@@ -113,27 +260,81 @@ let we_are_bruteforcing = [];
             const rollcallId = rollcall.rollcall_id;
             // console.log(rollcall);
             if (rollcall.status == "on_call_fine" || rollcall.status == "on_call" || rollcall.status_name == "on_call_fine" || rollcall.status_name == "on_call") {
-              console.log("[Auto Sign-in] Note that #" + rollcallId + " is on call.");
-              ;
+              if (!alreadyOnCallNotified.has(rollcallId)) {
+                alreadyOnCallNotified.add(rollcallId);
+                const hint = buildRollcallCourseHint(rollcall);
+                signNotify(
+                  `[签到状态] 点名 #${rollcallId} 已显示为已签到（on_call），无需再签。${rollcall.course_title || ""}${hint}`
+                );
+              }
               return;
             }
             console.log("[Auto Sign-in] Now answering rollcall #" + rollcallId);
-            if (rollcall.is_radar) {
-              sendBoth(`[Auto Sign-in] Answering new radar rollcall #${rollcallId}: ${rollcall.title} @ ${rollcall.course_title} by ${rollcall.created_by_name} (${rollcall.department_name})`);
-              answerRaderRollcall(RaderInfo[CONFIG.raderAt], rollcallId);
+            let handled = false;
+            const isRadar =
+              rollcall.is_radar === true || rollcall.source === "radar";
+            if (isRadar) {
+              handled = true;
+              const timeHint = buildRollcallTimeHint(rollcall);
+              const courseHint = buildRollcallCourseHint(rollcall);
+              if (!radarNotifySent.has(rollcallId)) {
+                radarNotifySent.add(rollcallId);
+                signNotify(
+                  `[Auto Sign-in] 开始自动雷达签到 #${rollcallId}: ${rollcall.title} @ ${rollcall.course_title} by ${rollcall.created_by_name} (${rollcall.department_name})${courseHint}\n${timeHint}`
+                );
+              }
+              if (!radarAnswerInFlight.has(rollcallId)) {
+                radarAnswerInFlight.add(rollcallId);
+                answerRaderRollcall(RaderInfo[CONFIG.raderAt], rollcallId)
+                  .then((ok) => {
+                    if (ok && !radarSuccessNotified.has(rollcallId)) {
+                      radarSuccessNotified.add(rollcallId);
+                      signNotify(
+                        `[Auto Sign-in] 雷达签到成功 #${rollcallId} ${rollcall.course_title || ""}${courseHint}`
+                      );
+                    }
+                    if (!ok && !radarFailureNotified.has(rollcallId)) {
+                      radarFailureNotified.add(rollcallId);
+                      signNotify(
+                        `[Auto Sign-in] Radar rollcall #${rollcallId} 自动签到失败（已尝试配置点、全部信标与三点定位）。请检查 CONFIG.raderAt 是否匹配教室，或手动签到。${courseHint}\n${timeHint}`
+                      );
+                    }
+                  })
+                  .catch((err) => {
+                    signNotify(
+                      `[Auto Sign-in] Radar rollcall #${rollcallId} 签到过程异常: ${err?.message || err}${courseHint}`
+                    );
+                  })
+                  .finally(() => {
+                    radarAnswerInFlight.delete(rollcallId);
+                  });
+              }
             }
             if (rollcall.is_number) {
+              handled = true;
               if(we_are_bruteforcing.includes(rollcallId)){
                 console.log("[Auto Sign-in] We are already bruteforcing rollcall #" + rollcallId);
                 return;
               }
               we_are_bruteforcing.push(rollcallId);
-              sendBoth(`[Auto Sign-in] Bruteforcing new number rollcall #${rollcallId}: ${rollcall.title} @ ${rollcall.course_title} by ${rollcall.created_by_name} (${rollcall.department_name})`);
-              batchNumberRollCall(rollcallId);
+              const timeHint = buildRollcallTimeHint(rollcall);
+              const courseHint = buildRollcallCourseHint(rollcall);
+              signNotify(
+                `[Auto Sign-in] 开始数字点名爆破 #${rollcallId}: ${rollcall.title} @ ${rollcall.course_title} by ${rollcall.created_by_name} (${rollcall.department_name})${courseHint}\n${timeHint}`
+              );
+              batchNumberRollCall(rollcallId, courseHint);
             }
-            console.log(`[Auto Sign-in] Rollcall #${rollcallId} has an unknown type and we cannot handle it yet.`)
-            console.log("[Auto Sign-in] Rollcall details: ", rollcall);
-            console.log("[Auto Sign-in] If you see this message, please consider \x1b[31m submitting an issue with the rollcall details above \x1b[0m so that we can support this type in the future. Thank you!");
+            if (!handled) {
+              const detail = JSON.stringify(rollcall);
+              const snippet =
+                detail.length > 1200 ? detail.slice(0, 1200) + "…" : detail;
+              signNotify(
+                `[Auto Sign-in] Rollcall #${rollcallId} 类型未知，无法自动处理，请手动签到。${buildRollcallCourseHint(rollcall)}\n${snippet}`
+              );
+              console.log(
+                `[Auto Sign-in] Rollcall #${rollcallId} has an unknown type and we cannot handle it yet.`
+              );
+            }
           });
         }
       }).catch((e) => {
@@ -141,6 +342,17 @@ let we_are_bruteforcing = [];
           `[Auto Sign-in](Req #${++req_num}) Failed to fetch rollcalls: `,
           e
         );
+        const now = Date.now();
+        if (now - lastFetchRollcallsErrorDingAt > 5 * 60 * 1000) {
+          lastFetchRollcallsErrorDingAt = now;
+          const msg = String(e?.message || e);
+          const iterableHint = msg.includes("is not iterable")
+            ? " 常见原因：未加载到 ZJU_PASSWORD（login-zju 加密密码时崩溃）。请确认仓库根目录存在 .env 且含密码，或从项目根执行 node courses.zju/autosign.js。"
+            : "";
+          signNotify(
+            `[Auto Sign-in] 拉取点名列表失败: ${msg}（5 分钟内同类告警已合并）${iterableHint}`
+          );
+        }
       });
 
     await sleep(CONFIG.coldDownTime);
@@ -362,11 +574,108 @@ async function answerRaderRollcall(raderXY, rid) {
   const finalOutcome = await _req(est.lon, est.lat);
 
   if (finalOutcome?.status_name === "on_call_fine") {
-    sendBoth(`[Autosign] Estimated position success: ${est.lon}, ${est.lat}`);
+    console.log(
+      "[Autosign] SphereFit success",
+      est.lon,
+      est.lat
+    );
     return true;
   }
 
   return false;
+}
+
+async function getCurrentClassroomSession() {
+  const res = await classroom.fetch(
+    "https://education.cmc.zju.edu.cn/personal/courseapi/vlabpassportapi/v1/account-profile/course?nowpage=1&per-page=100&force_mycourse=1"
+  );
+  const data = await res.json();
+  const courseList = data?.params?.result?.data || [];
+
+  for (const c of courseList) {
+    const catRes = await classroom.fetch(
+      "https://yjapi.cmc.zju.edu.cn/courseapi/v2/course/catalogue?course_id=" + c.Id
+    );
+    const catData = await catRes.json();
+    const live = (catData?.result?.data || []).find((v) => v.status === "1");
+    if (live) {
+      let content = {};
+      try {
+        content = JSON.parse(live.content || "{}");
+      } catch (_e) {
+        content = {};
+      }
+      return {
+        courseId: c.Id,
+        courseTitle: c.Title,
+        teacher: c.Teacher,
+        subId: live.sub_id,
+        subTitle: live.title,
+        transSocketUrl: content.trans_socket_url || "",
+      };
+    }
+  }
+  return null;
+}
+
+async function fetchLatestTranscriptLine(subId) {
+  const res = await classroom.fetch(
+    `https://yjapi.cmc.zju.edu.cn/courseapi/v3/web-socket/search-trans-result?sub_id=${subId}&format=json`
+  );
+  const data = await res.json();
+  const list = data?.list || [];
+  let latest = null;
+  for (const item of list) {
+    for (const c of item?.all_content || []) {
+      const text = (c?.Text || "").trim();
+      if (!text) continue;
+      const beginSec = Number(c?.BeginSec || 0);
+      if (!latest || beginSec >= latest.beginSec) {
+        latest = { beginSec, text };
+      }
+    }
+  }
+  return latest;
+}
+
+async function startTranscriptDebugLoop() {
+  sendBoth("[Transcript Debug] Enabled. Looking for active classroom session...");
+  let currentSubId = "";
+  let lastTranscript = "";
+  let lastNoTranscriptLogAt = 0;
+
+  while (true) {
+    try {
+      const session = await getCurrentClassroomSession();
+      if (!session) {
+        console.log("[Transcript Debug] No active classroom session.");
+      } else {
+        if (session.subId !== currentSubId) {
+          currentSubId = session.subId;
+          lastTranscript = "";
+          sendBoth(
+            `[Transcript Debug] Active: ${session.courseTitle} - ${session.subTitle} @ ${session.teacher} (sub_id=${session.subId})`
+          );
+          console.log(`[Transcript Debug] trans_socket_url: ${session.transSocketUrl || "<empty>"}`);
+        }
+
+        const latest = await fetchLatestTranscriptLine(session.subId);
+        if (latest?.text && latest.text !== lastTranscript) {
+          lastTranscript = latest.text;
+          console.log(`[Transcript Debug] ${latest.text}`);
+        } else if (!latest?.text) {
+          const now = Date.now();
+          if (now - lastNoTranscriptLogAt > 30000) {
+            lastNoTranscriptLogAt = now;
+            console.log("[Transcript Debug] Active session found, but no transcript text yet.");
+          }
+        }
+      }
+    } catch (e) {
+      console.log("[Transcript Debug] Error:", e?.message || e);
+    }
+    await sleep(CONFIG.transcriptDebugIntervalMs);
+  }
 }
 
 async function answerNumberRollcall(numberCode, rid) {
@@ -409,7 +718,7 @@ async function answerNumberRollcall(numberCode, rid) {
 }
 
 let currentBatchingRCs = [];
-async function batchNumberRollCall(rid) {
+async function batchNumberRollCall(rid, courseHint = "") {
   if (currentBatchingRCs.includes(rid)) return;
 
   currentBatchingRCs.push(rid);
@@ -458,10 +767,14 @@ async function batchNumberRollCall(rid) {
   }
 
   if (foundCode) {
-    sendBoth(`[Auto Sign-in] Number Rollcall ${rid} succeeded: found code ${foundCode}.`);
+    signNotify(
+      `[Auto Sign-in] 数字点名成功 #${rid}，口令 ${foundCode}${courseHint}`
+    );
   }
   else {
-    sendBoth(`[Auto Sign-in] Number Rollcall ${rid} failed to find valid code.`);
+    signNotify(
+      `[Auto Sign-in] 数字点名失败 #${rid}（未试出有效口令）${courseHint}`
+    );
   }
 }
 
